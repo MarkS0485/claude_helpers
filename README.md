@@ -131,8 +131,10 @@ python  claude_overlay.py --edge 4        # full Samsung-Edge: all four edges
   overlay (with backoff) if it ever dies, and the 1s UI heartbeat survives
   internal errors instead of silently vanishing behind other windows.
   Crashes leave a trail in `~/.claude_overlay.log`.
-- Follows the taskbar if you move or resize it, and stays put across DPI
-  scaling (125% / 150% displays).
+- Follows the taskbar if you move or resize it, stays put across DPI
+  scaling (125% / 150% displays), and snaps back to its edges within a
+  second when docking, undocking, or resolution changes shuffle windows
+  around.
 - If polling fails for a few minutes the colours dim to a third brightness —
   a bright bar always means live data.
 - Same endpoint, credentials, requirements, and polite once-a-minute default

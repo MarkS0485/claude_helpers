@@ -236,6 +236,17 @@ def work_area(root):
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
+SWP_NOZORDER_NOACTIVATE = 0x0004 | 0x0010
+
+
+def window_rect(hwnd):
+    """Where the OS says the window actually is -> (x, y, w, h)."""
+    rect = _Rect()
+    ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    return (rect.left, rect.top,
+            rect.right - rect.left, rect.bottom - rect.top)
+
+
 # --- one strip on one edge --------------------------------------------------
 
 class Strip:
@@ -245,7 +256,7 @@ class Strip:
         self.app = app
         self.edge = edge
         self.horizontal = edge in ("top", "bottom")
-        self.geometry = None
+        self._hwnd = None
         self.span = 0   # strip length along its fill axis
         self.render_key = None
         self.hits = []  # [(a0, a1, label, bucket)] for the hover tooltip
@@ -269,18 +280,37 @@ class Strip:
 
     # -- geometry / drawing --
 
+    def os_hwnd(self):
+        """HWND of the real top-level window (Tk's wrapper), once mapped."""
+        if self._hwnd is None and sys.platform == "win32":
+            self.win.update_idletasks()
+            inner = self.win.winfo_id()
+            self._hwnd = ctypes.windll.user32.GetParent(inner) or inner
+        return self._hwnd
+
     def place(self, area):
         """Pin to this strip's edge of the work area (so the bottom strip
-        sits just above the taskbar). Re-checked every tick to follow a
-        moved or resized taskbar."""
+        sits just above the taskbar). Re-checked every tick against where
+        the OS says the window ACTUALLY is, not where we last put it:
+        resolution changes, docking and undocking make Windows shuffle
+        windows around without the computed target moving, and after such
+        an external move Tk's own idea of its geometry can't be trusted -
+        so both the check (GetWindowRect) and the correction
+        (SetWindowPos) go straight to Win32."""
         area = inset_area(area, self.app.edges, self.edge,
                           self.app.thickness)
         w, h, x, y = geometry_for(self.edge, area, self.app.thickness)
-        geometry = "{}x{}+{}+{}".format(w, h, x, y)
-        if geometry != self.geometry:
-            self.geometry = geometry
-            self.span = w if self.horizontal else h
-            self.win.geometry(geometry)
+        self.span = w if self.horizontal else h
+        hwnd = self.os_hwnd()
+        if hwnd:
+            if window_rect(hwnd) != (x, y, w, h):
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, 0, x, y, w, h, SWP_NOZORDER_NOACTIVATE)
+        else:  # non-Windows: Tk's view is all there is
+            actual = (self.win.winfo_x(), self.win.winfo_y(),
+                      self.win.winfo_width(), self.win.winfo_height())
+            if actual != (x, y, w, h):
+                self.win.geometry("{}x{}+{}+{}".format(w, h, x, y))
 
     def redraw(self, picked, pcts, stale, phase):
         render_key = (self.span, stale, phase, pcts)
