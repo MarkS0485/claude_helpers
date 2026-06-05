@@ -100,3 +100,31 @@ needs you to open Claude Code once.
   monitor recovers by itself.
 - The usage endpoint is not officially documented and could change shape
   in a future Claude Code release.
+
+## claude_overlay.py — neon taskbar overlay (Windows)
+
+The usage monitor as ambient UI: an always-on-top strip a few pixels thick
+sitting just above the taskbar, spanning the full screen width in three equal
+segments — **Session (5h) | Weekly (all) | Weekly Opus** — each one an
+RGB-gamer-grade gradient. The bar fills left-to-right as the limit is used,
+revealing a full-brightness sweep from neon green through yellow and orange
+into pure red, so the colour at the tip of the bar *is* the severity readout:
+green tip = relax, orange tip = getting warm, red = nearly bust. Any segment
+at ≥90% pulses. If a bucket is missing from the API response (e.g. no Opus
+limit on your plan), the next available one (Weekly Sonnet) takes the slot.
+
+```sh
+python  claude_overlay.py                  # refresh every 60s, 4px thick
+pythonw claude_overlay.py --thickness 2    # no console window, thinner bar
+```
+
+- **Hover** a segment for the exact percentage, reset time, and last-update
+  timestamp; **right-click** for refresh-now / quit.
+- Follows the taskbar if you move or resize it, and stays put across DPI
+  scaling (125% / 150% displays).
+- If polling fails for a few minutes the colours dim to a third brightness —
+  a bright bar always means live data.
+- Same endpoint, credentials, requirements, and polite once-a-minute default
+  as `claude_usage.py`; the two run happily side by side.
+- To start it with Windows: `Win+R` → `shell:startup` → drop in a shortcut
+  running `pythonw C:\path\to\claude_overlay.py`.

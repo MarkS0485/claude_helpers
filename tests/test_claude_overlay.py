@@ -1,0 +1,128 @@
+"""Unit tests for claude_overlay.py — pure helpers only, no GUI, no network."""
+
+import unittest
+
+import claude_overlay as co
+
+SAMPLE = {
+    "five_hour": {
+        "utilization": 15.0,
+        "resets_at": "2026-06-05T15:10:00.936507+00:00",
+    },
+    "seven_day": {
+        "utilization": 54.0,
+        "resets_at": "2026-06-07T10:59:59.936529+00:00",
+    },
+    "seven_day_opus": None,
+    "seven_day_sonnet": {
+        "utilization": 12.0,
+        "resets_at": "2026-06-07T10:59:59.936536+00:00",
+    },
+}
+
+
+class PickBucketsTests(unittest.TestCase):
+    def test_skips_null_buckets_and_keeps_order(self):
+        picked = co.pick_buckets(SAMPLE)
+        self.assertEqual([k for k, _, _ in picked],
+                         ["five_hour", "seven_day", "seven_day_sonnet"])
+
+    def test_caps_at_three_segments(self):
+        data = dict(SAMPLE, seven_day_opus={"utilization": 1.0,
+                                            "resets_at": "2026-06-07T10:59:59+00:00"})
+        picked = co.pick_buckets(data)
+        self.assertEqual(len(picked), 3)
+        self.assertEqual([k for k, _, _ in picked],
+                         ["five_hour", "seven_day", "seven_day_opus"])
+
+    def test_handles_no_data(self):
+        self.assertEqual(co.pick_buckets(None), [])
+        self.assertEqual(co.pick_buckets({}), [])
+
+    def test_skips_bucket_with_null_utilization(self):
+        data = {"five_hour": {"utilization": None, "resets_at": "x"}}
+        self.assertEqual(co.pick_buckets(data), [])
+
+
+class SegmentBoundsTests(unittest.TestCase):
+    def test_three_equal_slices_cover_the_width(self):
+        bounds = co.segment_bounds(3000, count=3, gap=2)
+        self.assertEqual(bounds[0][0], 0)
+        self.assertEqual(bounds[-1][1], 3000)
+        # contiguous edges, separated only by the gap
+        self.assertEqual(bounds[1][0] - bounds[0][1], 2)
+        self.assertEqual(bounds[2][0] - bounds[1][1], 2)
+        # equal widths bar the gap
+        self.assertEqual(bounds[0][1] - bounds[0][0], 1000)
+
+    def test_odd_width_still_monotonic(self):
+        bounds = co.segment_bounds(1921, count=3, gap=2)
+        for x0, x1 in bounds:
+            self.assertLess(x0, x1)
+        self.assertEqual(bounds[-1][1], 1921)
+
+
+class FillWidthTests(unittest.TestCase):
+    def test_proportional(self):
+        self.assertEqual(co.fill_width(0, 600), 0)
+        self.assertEqual(co.fill_width(50, 600), 300)
+        self.assertEqual(co.fill_width(100, 600), 600)
+
+    def test_clamps_out_of_range(self):
+        self.assertEqual(co.fill_width(250, 600), 600)
+        self.assertEqual(co.fill_width(-5, 600), 0)
+
+
+class GradientColourTests(unittest.TestCase):
+    def test_endpoints_and_midpoint(self):
+        self.assertEqual(co.gradient_colour(0.0), "#00ff00")   # neon green
+        self.assertEqual(co.gradient_colour(0.5), "#ffff00")   # yellow
+        self.assertEqual(co.gradient_colour(1.0), "#ff0000")   # pure red
+
+    def test_clamps_fraction(self):
+        self.assertEqual(co.gradient_colour(-0.5), "#00ff00")
+        self.assertEqual(co.gradient_colour(2.0), "#ff0000")
+
+    def test_brightness_scales_channels(self):
+        self.assertEqual(co.gradient_colour(0.0, brightness=0.2), "#003300")
+        self.assertEqual(co.gradient_colour(1.0, brightness=0.0), "#000000")
+        self.assertEqual(co.gradient_colour(1.0, brightness=5.0), "#ff0000")
+
+
+class GradientRunsTests(unittest.TestCase):
+    def test_runs_cover_exactly_the_fill(self):
+        runs = co.gradient_runs(600, 300)
+        self.assertEqual(runs[0][0], 0)
+        self.assertEqual(runs[-1][1], 300)
+        for (a, b) in zip(runs, runs[1:]):  # contiguous, no gaps or overlap
+            self.assertEqual(a[1], b[0])
+
+    def test_empty_when_nothing_to_fill(self):
+        self.assertEqual(co.gradient_runs(600, 0), [])
+        self.assertEqual(co.gradient_runs(0, 100), [])
+
+    def test_gradient_spans_segment_not_fill(self):
+        # a half-full bar ends at yellow; only a full bar reaches red
+        half = co.gradient_runs(600, 300)
+        full = co.gradient_runs(600, 600)
+        r, g, _ = (int(half[-1][2][i:i + 2], 16) for i in (1, 3, 5))
+        self.assertGreaterEqual(r, 250)  # ~yellow tip at 50% (band colour is
+        self.assertEqual(g, 255)         # sampled at the band's midpoint)
+        r, g, _ = (int(full[-1][2][i:i + 2], 16) for i in (1, 3, 5))
+        self.assertEqual(r, 255)
+        self.assertLess(g, 8)  # effectively pure red at 100%
+        self.assertEqual(half[0][2], full[0][2])  # both start neon green
+
+    def test_run_count_capped_by_steps_and_width(self):
+        self.assertLessEqual(len(co.gradient_runs(2000, 2000)), co.GRADIENT_STEPS)
+        runs = co.gradient_runs(10, 10)  # narrower than the step count
+        self.assertLessEqual(len(runs), 10)
+        self.assertEqual(runs[-1][1], 10)
+
+    def test_brightness_passed_through(self):
+        dimmed = co.gradient_runs(600, 600, brightness=0.2)
+        self.assertEqual(dimmed[0][2], "#003300")
+
+
+if __name__ == "__main__":
+    unittest.main()
