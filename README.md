@@ -5,21 +5,39 @@ Small utilities for working with Claude / Claude Code.
 ## claude_usage.py — live usage monitor
 
 A terminal dashboard showing your Claude subscription usage — session (5-hour)
-and weekly limits, with colour-coded bars and reset countdowns — refreshed
-every 30 seconds. No more checking the website.
+and weekly limits, with colour-coded bars, reset countdowns, recent-usage
+windows, and a burn-rate forecast — refreshed every 30 seconds. No more
+checking the website.
 
 ```
-Claude usage  updated 13:51:48
+Claude usage  updated 14:05:14
 
-  Session (5h)   ████░░░░░░░░░░░░░░░░░░░░░░░░░░  15.0%
-                 Fri 05 Jun 16:10  (resets in 2h 18m)
+  Session (5h)   ██████████████░░░░░░░░░░░░░░░░  46.5%
+                 Fri 05 Jun 16:10  (resets in 2h 04m)
+                 last 15m +6.8%  30m +13.5%  60m +27.0%
+                 LIMIT BUST ~16:04 (5m before reset) - slow to <=25.7%/h (cut 5%)
 
-  Weekly (all)   ████████████████░░░░░░░░░░░░░░  54.0%
-                 Sun 07 Jun 12:00  (resets in 1d 22h)
-
-  Weekly Sonnet  ████░░░░░░░░░░░░░░░░░░░░░░░░░░  12.0%
-                 Sun 07 Jun 12:00  (resets in 1d 22h)
+  Weekly (all)   █████████████████░░░░░░░░░░░░░  55.4%
+                 Sun 07 Jun 11:59  (resets in 1d 21h)
+                 last 15m +0.3%  30m +0.6%  60m +1.2%
+                 on pace 1.2%/h -> ~78% at reset
 ```
+
+For each limit you get:
+
+- **last 15m / 30m / 60m** — how many percentage points you actually burned
+  in each window (limit resets mid-window are handled, so the numbers never
+  go negative).
+- **Limits bust forecast** — extrapolates your current pace to the reset
+  time. If you'd cross 100% first, it tells you *when* you'd bust, how long
+  before the reset, and the pace to slow to so the limit lasts exactly until
+  it resets. Otherwise it shows where you'll land at reset, or that you're
+  idle and coasting.
+
+Windows need history: the script samples your utilization on every poll into
+`~/.claude_usage_history.json` (timestamps and percentages only — never
+tokens), so after an hour of running, all three windows are live. History
+survives restarts and is trimmed after ~26 hours.
 
 ### Requirements
 
