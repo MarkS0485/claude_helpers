@@ -1,28 +1,43 @@
 #!/usr/bin/env python3
-"""Neon Claude usage overlay for the Windows taskbar.
+"""Neon Claude usage overlay for the Windows taskbar (or any screen edge).
 
-A strip a few pixels thick that sits just above the taskbar, always on top,
-spanning the full screen width in three equal segments:
+A strip a few pixels thick pinned to a screen edge - by default the bottom,
+sitting just above the taskbar - always on top, split into three equal
+segments:
 
     Session (5h)        |  Weekly (all)        |  Weekly Opus
 
 Each segment is a full-brightness RGB gradient - neon green at 0% sweeping
-through yellow and orange into pure red at 100% - revealed left-to-right as
+through yellow and orange into pure red at 100% - revealed along the strip as
 the limit is used, so the colour at the tip of the bar reads as how close to
 the limit you are. Any segment at >=90% pulses. Hover for the exact numbers
 and reset time; right-click to refresh or quit. Uses the same endpoint and
 credentials as claude_usage.py - stdlib only, no pip installs.
 
+--edge top|bottom|left|right pins it to any display edge, Samsung-Edge
+style. Side strips stack the segments bottom-up and their bars fill
+upwards; the top strip is the bottom one mirrored (bottom-left segment
+lands top-right, the middle stays the middle).
+
+The launched process is a tiny supervisor: the actual overlay runs as a
+child that gets restarted automatically (with backoff) if it ever dies.
+Right-click -> Quit stops both. Crashes and callback errors are appended to
+~/.claude_overlay.log so failures leave a trail.
+
 Usage:  python claude_overlay.py [--interval SECONDS] [--thickness PIXELS]
+                                 [--edge bottom|top|left|right]
         (use pythonw instead of python to run without a console window)
 """
 
 import argparse
 import colorsys
 import ctypes
+import os
+import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 from datetime import datetime, timezone
 
@@ -44,6 +59,27 @@ PULSE_DIM = 0.55      # alert pulse alternates full and this brightness
 STALE_BRIGHTNESS = 1.0 / 3.0  # missed-polls look
 STALE_POLLS = 3       # missed polls before the colours dim
 
+EDGES = ("bottom", "top", "left", "right")
+
+LOG_PATH = os.path.expanduser("~/.claude_overlay.log")
+LOG_MAX_BYTES = 256 * 1024  # rotate to .1 beyond this
+RESTART_DELAY = 2     # seconds before the first respawn...
+RESTART_DELAY_MAX = 60  # ...doubling up to this cap
+HEALTHY_SECS = 600    # uptime that earns the backoff a reset
+
+
+def log_line(text):
+    """Append a timestamped line to the crash log. Never raises - logging
+    must not be the thing that takes the overlay down."""
+    try:
+        if (os.path.exists(LOG_PATH)
+                and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES):
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("{:%Y-%m-%d %H:%M:%S} {}\n".format(datetime.now(), text))
+    except OSError:
+        pass
+
 
 # --- pure helpers (unit tested, no GUI) -----------------------------------
 
@@ -57,10 +93,10 @@ def pick_buckets(data):
     return out[:SEGMENTS]
 
 
-def segment_bounds(width, count=SEGMENTS, gap=GAP):
-    """[(x0, x1), ...] dividing `width` into `count` equal slices with a
-    `gap` px separator drawn out of the left edge of slices 1..n."""
-    edges = [round(i * width / count) for i in range(count + 1)]
+def segment_bounds(span, count=SEGMENTS, gap=GAP):
+    """[(a0, a1), ...] dividing `span` px into `count` equal slices with a
+    `gap` px separator drawn out of the leading edge of slices 1..n."""
+    edges = [round(i * span / count) for i in range(count + 1)]
     return [(edges[i] + (gap if i else 0), edges[i + 1]) for i in range(count)]
 
 
@@ -79,7 +115,7 @@ def gradient_colour(frac, brightness=1.0):
 
 
 def gradient_runs(seg_width, fill, brightness=1.0, steps=GRADIENT_STEPS):
-    """[(x0, x1, colour), ...] painting the first `fill` px of a segment.
+    """[(a0, a1, colour), ...] painting the first `fill` px of a segment.
 
     The gradient always spans the whole `seg_width` - the fill just reveals
     it - so the colour at the tip of the bar is the severity readout: green
@@ -95,10 +131,39 @@ def gradient_runs(seg_width, fill, brightness=1.0, steps=GRADIENT_STEPS):
     for i in range(steps):
         if edges[i] >= fill:
             break
-        x0, x1 = edges[i], min(edges[i + 1], fill)
-        frac = (x0 + x1) / 2.0 / seg_width
-        runs.append((x0, x1, gradient_colour(frac, brightness)))
+        a0, a1 = edges[i], min(edges[i + 1], fill)
+        frac = (a0 + a1) / 2.0 / seg_width
+        runs.append((a0, a1, gradient_colour(frac, brightness)))
     return runs
+
+
+def axis_to_canvas(edge, span, a0, a1):
+    """Map an interval on the strip's fill axis to canvas coordinates.
+
+    The fill axis runs the way the bars grow: left->right along the bottom
+    edge; right->left along the top (the bottom strip mirrored, so the
+    bottom-left segment sits top-right and the middle stays the middle);
+    bottom->top on the sides, so side bars fill upwards. Canvas x grows
+    right and y grows down, hence the flip for everything but `bottom`.
+    """
+    if edge == "bottom":
+        return a0, a1
+    return span - a1, span - a0
+
+
+def geometry_for(edge, area, thickness):
+    """(width, height, x, y) pinning a `thickness` px strip to one edge of
+    the (left, top, right, bottom) work area."""
+    left, top, right, bottom = area
+    if edge == "bottom":
+        return right - left, thickness, left, bottom - thickness
+    if edge == "top":
+        return right - left, thickness, left, top
+    if edge == "left":
+        return thickness, bottom - top, left, top
+    if edge == "right":
+        return thickness, bottom - top, right - thickness, top
+    raise ValueError("unknown edge: {!r}".format(edge))
 
 
 # --- Windows plumbing ------------------------------------------------------
@@ -136,19 +201,21 @@ def work_area(root):
 # --- the overlay -----------------------------------------------------------
 
 class Overlay:
-    def __init__(self, root, interval, thickness):
+    def __init__(self, root, interval, thickness, edge):
         self.root = root
         self.interval = interval
         self.thickness = thickness
+        self.edge = edge
+        self.horizontal = edge in ("top", "bottom")
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.data = None
         self.fetched_ts = 0.0
         self.status = None
         self.geometry = None
-        self.width = 0
+        self.span = 0   # strip length along its long axis
         self.render_key = None
-        self.hits = []  # [(x0, x1, label, bucket)] for the hover tooltip
+        self.hits = []  # [(a0, a1, label, bucket)] for the hover tooltip
 
         root.overrideredirect(True)          # no border, no title bar
         root.attributes("-topmost", True)
@@ -156,6 +223,8 @@ class Overlay:
             root.attributes("-toolwindow", True)  # keep out of Alt-Tab
         except tk.TclError:
             pass
+        # callback errors otherwise vanish (pythonw has no stderr) - log them
+        root.report_callback_exception = self.on_callback_error
 
         self.canvas = tk.Canvas(root, highlightthickness=0, bd=0, bg=BG)
         self.canvas.pack(fill="both", expand=True)
@@ -173,6 +242,10 @@ class Overlay:
         threading.Thread(target=self.poll_loop, daemon=True).start()
         self.place()
         self.tick()
+
+    def on_callback_error(self, exc_type, exc, tb):
+        log_line("callback error: " + "".join(
+            traceback.format_exception(exc_type, exc, tb)).strip())
 
     # -- polling (background thread) --
 
@@ -193,6 +266,8 @@ class Overlay:
                 status = "no credentials - is Claude Code logged in?"
             except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 pass  # network blip - the bar dims if it goes on too long
+            except Exception:  # anything else must not kill the thread
+                log_line("poll error: " + traceback.format_exc())
             with self.lock:
                 self.status = status
             self.wake.wait(self.interval)
@@ -201,22 +276,37 @@ class Overlay:
     # -- geometry / drawing (UI thread) --
 
     def place(self):
-        """Pin to the bottom of the work area, i.e. just above the taskbar.
-        Re-checked every tick so a moved/resized taskbar is followed."""
-        left, _, right, bottom = work_area(self.root)
-        geometry = "{}x{}+{}+{}".format(
-            right - left, self.thickness, left, bottom - self.thickness)
+        """Pin to the chosen edge of the work area (so the bottom edge sits
+        just above the taskbar). Re-checked every tick to follow a moved or
+        resized taskbar."""
+        w, h, x, y = geometry_for(self.edge, work_area(self.root),
+                                  self.thickness)
+        geometry = "{}x{}+{}+{}".format(w, h, x, y)
         if geometry != self.geometry:
             self.geometry = geometry
-            self.width = right - left
+            self.span = w if self.horizontal else h
             self.root.geometry(geometry)
 
     def tick(self):
-        self.place()
-        self.redraw()
-        self.root.lift()
-        self.root.attributes("-topmost", True)  # re-assert against new windows
-        self.root.after(1000, self.tick)
+        """1s heartbeat. Must survive anything: if this loop dies the strip
+        stops re-asserting topmost and quietly disappears behind other
+        windows - which is a crash as far as the user can tell."""
+        try:
+            self.place()
+            self.redraw()
+            if self.root.state() != "normal":
+                self.root.deiconify()  # something hid us - come back
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+        except tk.TclError:
+            pass  # Tk mid-shutdown or in a bad state; next tick retries
+        except Exception:
+            log_line("tick error: " + traceback.format_exc())
+        finally:
+            try:
+                self.root.after(1000, self.tick)
+            except tk.TclError:
+                pass  # window destroyed - we're quitting
 
     def redraw(self):
         with self.lock:
@@ -227,16 +317,15 @@ class Overlay:
         pcts = tuple(b.get("utilization") or 0.0 for _, _, b in picked)
         # the 1s tick drives the alert pulse; otherwise hold the phase still
         phase = int(time.time()) % 2 if any(p >= ALERT_AT for p in pcts) else 0
-        render_key = (self.width, stale, phase, pcts)
+        render_key = (self.span, stale, phase, pcts)
         if render_key == self.render_key:
             return  # nothing moved - skip repainting the gradient runs
         self.render_key = render_key
 
-        c = self.canvas
-        c.delete("all")
+        self.canvas.delete("all")
         self.hits = []
-        for i, (x0, x1) in enumerate(segment_bounds(self.width)):
-            c.create_rectangle(x0, 0, x1, self.thickness, fill=TRACK, width=0)
+        for i, (a0, a1) in enumerate(segment_bounds(self.span)):
+            self.rect(a0, a1, TRACK)
             if i >= len(picked):
                 continue
             _, label, bucket = picked[i]
@@ -247,28 +336,39 @@ class Overlay:
                 brightness = PULSE_DIM
             else:
                 brightness = 1.0
-            fw = fill_width(pct, x1 - x0)
-            for rx0, rx1, colour in gradient_runs(x1 - x0, fw, brightness):
-                c.create_rectangle(x0 + rx0, 0, x0 + rx1, self.thickness,
-                                   fill=colour, width=0)
-            self.hits.append((x0, x1, label, bucket))
+            fw = fill_width(pct, a1 - a0)
+            for r0, r1, colour in gradient_runs(a1 - a0, fw, brightness):
+                self.rect(a0 + r0, a0 + r1, colour)
+            self.hits.append((a0, a1, label, bucket))
+
+    def rect(self, a0, a1, colour):
+        """Filled rectangle spanning [a0, a1) on the strip's fill axis."""
+        c0, c1 = axis_to_canvas(self.edge, self.span, a0, a1)
+        if self.horizontal:
+            self.canvas.create_rectangle(c0, 0, c1, self.thickness,
+                                         fill=colour, width=0)
+        else:
+            self.canvas.create_rectangle(0, c0, self.thickness, c1,
+                                         fill=colour, width=0)
 
     # -- hover tooltip --
 
     def on_motion(self, event):
-        info = self.tip_info(event.x)
+        raw = event.x if self.horizontal else event.y
+        info = self.tip_info(
+            raw if self.edge == "bottom" else self.span - raw)
         if info:
-            self.show_tip(event.x_root, *info)
+            self.show_tip(event, *info)
         else:
             self.hide_tip()
 
-    def tip_info(self, x):
-        """(text, colour) for the segment under x - text in the same
+    def tip_info(self, pos):
+        """(text, colour) for the segment under `pos` - text in the same
         green->red severity colour as the tip of that segment's bar."""
         with self.lock:
             fetched_ts, status = self.fetched_ts, self.status
-        for x0, x1, label, bucket in self.hits:
-            if x0 <= x < x1:
+        for a0, a1, label, bucket in self.hits:
+            if a0 <= pos < a1:
                 pct = bucket.get("utilization") or 0.0
                 when = datetime.fromisoformat(bucket["resets_at"]).astimezone()
                 left = when - datetime.now(timezone.utc).astimezone()
@@ -285,7 +385,7 @@ class Overlay:
                     gradient_colour(0.0))
         return None
 
-    def show_tip(self, x_root, text, fg):
+    def show_tip(self, event, text, fg):
         if self.tip is None:
             self.tip = tk.Toplevel(self.root)
             self.tip.overrideredirect(True)
@@ -298,8 +398,17 @@ class Overlay:
         self.tip.update_idletasks()
         w = self.tip.winfo_reqwidth()
         h = self.tip.winfo_reqheight()
-        x = min(max(x_root - w // 2, 0), max(self.width - w, 0))
-        y = self.root.winfo_rooty() - h - 6
+        margin = self.thickness + 6
+        if self.edge == "bottom":
+            x, y = event.x_root - w // 2, self.root.winfo_rooty() - h - 6
+        elif self.edge == "top":
+            x, y = event.x_root - w // 2, self.root.winfo_rooty() + margin
+        elif self.edge == "left":
+            x, y = self.root.winfo_rootx() + margin, event.y_root - h // 2
+        else:  # right
+            x, y = self.root.winfo_rootx() - w - 6, event.y_root - h // 2
+        x = min(max(x, 0), max(self.root.winfo_screenwidth() - w, 0))
+        y = min(max(y, 0), max(self.root.winfo_screenheight() - h, 0))
         self.tip.geometry("+{}+{}".format(x, y))
         self.tip.deiconify()
 
@@ -308,23 +417,62 @@ class Overlay:
             self.tip.withdraw()
 
 
+# --- supervisor ------------------------------------------------------------
+
+def supervise():
+    """Run the actual overlay as a child process and bring it back if it
+    dies. A clean exit (right-click -> Quit) stops the supervisor too; any
+    other exit is logged and the child is relaunched with exponential
+    backoff, reset after a healthy stretch of uptime."""
+    delay = RESTART_DELAY
+    cmd = [sys.executable, os.path.abspath(__file__)] + sys.argv[1:] + ["--child"]
+    while True:
+        started = time.time()
+        try:
+            code = subprocess.call(cmd)
+        except KeyboardInterrupt:
+            return 0
+        if code == 0:
+            return 0  # user quit
+        if time.time() - started >= HEALTHY_SECS:
+            delay = RESTART_DELAY
+        log_line("overlay exited code {} after {:.0f}s - restart in {}s"
+                 .format(code, time.time() - started, delay))
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            return 0
+        delay = min(delay * 2, RESTART_DELAY_MAX)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Neon Claude usage overlay above the taskbar")
+        description="Neon Claude usage overlay pinned to a screen edge")
     parser.add_argument("--interval", type=int, default=60,
                         help="refresh seconds (default 60 - the API is rate "
                              "limited, be polite)")
     parser.add_argument("--thickness", type=int, default=4,
-                        help="bar height in pixels (default 4)")
+                        help="bar thickness in pixels (default 4)")
+    parser.add_argument("--edge", choices=EDGES, default="bottom",
+                        help="screen edge to pin to (default bottom, i.e. "
+                             "just above the taskbar)")
+    parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if tk is None:
         sys.exit("tkinter is not available in this Python install")
+    if not args.child:
+        sys.exit(supervise())
+
     make_dpi_aware()
-    root = tk.Tk()
-    root.title("Claude usage overlay")
-    Overlay(root, args.interval, max(args.thickness, 1))
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        root.title("Claude usage overlay")
+        Overlay(root, args.interval, max(args.thickness, 1), args.edge)
+        root.mainloop()
+    except Exception:
+        log_line("fatal: " + traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == "__main__":

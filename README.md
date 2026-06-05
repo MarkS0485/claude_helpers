@@ -116,10 +116,19 @@ limit on your plan), the next available one (Weekly Sonnet) takes the slot.
 ```sh
 python  claude_overlay.py                  # refresh every 60s, 4px thick
 pythonw claude_overlay.py --thickness 2    # no console window, thinner bar
+python  claude_overlay.py --edge right     # Samsung-Edge mode
 ```
 
 - **Hover** a segment for the exact percentage, reset time, and last-update
   timestamp; **right-click** for refresh-now / quit.
+- `--edge top|bottom|left|right` pins it to any display edge. Side strips
+  stack the segments bottom-up and fill upwards; the top strip is the
+  bottom one mirrored (bottom-left segment lands top-right, middle stays
+  the middle).
+- Self-healing: the launched process is a tiny supervisor that restarts the
+  overlay (with backoff) if it ever dies, and the 1s UI heartbeat survives
+  internal errors instead of silently vanishing behind other windows.
+  Crashes leave a trail in `~/.claude_overlay.log`.
 - Follows the taskbar if you move or resize it, and stays put across DPI
   scaling (125% / 150% displays).
 - If polling fails for a few minutes the colours dim to a third brightness —

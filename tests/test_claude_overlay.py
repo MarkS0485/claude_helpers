@@ -73,6 +73,53 @@ class FillWidthTests(unittest.TestCase):
         self.assertEqual(co.fill_width(-5, 600), 0)
 
 
+class GeometryForTests(unittest.TestCase):
+    AREA = (0, 0, 2560, 1380)  # 2560x1440 screen, 60px taskbar at the bottom
+
+    def test_bottom_sits_on_the_taskbar_edge(self):
+        self.assertEqual(co.geometry_for("bottom", self.AREA, 4),
+                         (2560, 4, 0, 1376))
+
+    def test_top(self):
+        self.assertEqual(co.geometry_for("top", self.AREA, 4),
+                         (2560, 4, 0, 0))
+
+    def test_left_and_right_run_vertically(self):
+        self.assertEqual(co.geometry_for("left", self.AREA, 4),
+                         (4, 1380, 0, 0))
+        self.assertEqual(co.geometry_for("right", self.AREA, 4),
+                         (4, 1380, 2556, 0))
+
+    def test_offset_work_area(self):
+        # taskbar on the left: work area starts at x=60
+        area = (60, 0, 2560, 1440)
+        self.assertEqual(co.geometry_for("left", area, 2), (2, 1440, 60, 0))
+        self.assertEqual(co.geometry_for("bottom", area, 2),
+                         (2500, 2, 60, 1438))
+
+    def test_unknown_edge_raises(self):
+        with self.assertRaises(ValueError):
+            co.geometry_for("diagonal", self.AREA, 4)
+
+
+class AxisToCanvasTests(unittest.TestCase):
+    def test_bottom_is_identity(self):
+        self.assertEqual(co.axis_to_canvas("bottom", 900, 0, 100), (0, 100))
+
+    def test_top_is_the_bottom_mirrored(self):
+        # the first segment (axis 0..100) lands at the far canvas end:
+        # bottom-left becomes top-right, the middle stays the middle
+        self.assertEqual(co.axis_to_canvas("top", 900, 0, 100), (800, 900))
+        self.assertEqual(co.axis_to_canvas("top", 900, 400, 500), (400, 500))
+
+    def test_sides_fill_upwards(self):
+        # axis 0 is the bottom of the screen; canvas y grows downward
+        self.assertEqual(co.axis_to_canvas("left", 1380, 0, 100),
+                         (1280, 1380))
+        self.assertEqual(co.axis_to_canvas("right", 1380, 1280, 1380),
+                         (0, 100))
+
+
 class GradientColourTests(unittest.TestCase):
     def test_endpoints_and_midpoint(self):
         self.assertEqual(co.gradient_colour(0.0), "#00ff00")   # neon green
