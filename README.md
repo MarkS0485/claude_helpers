@@ -36,7 +36,7 @@ previous version and other settings are preserved untouched. Use
 
 A terminal dashboard showing your Claude subscription usage — session (5-hour)
 and weekly limits, with colour-coded bars, reset countdowns, recent-usage
-windows, and a burn-rate forecast — refreshed every 30 seconds. No more
+windows, and a burn-rate forecast — refreshed every minute. No more
 checking the website.
 
 ```
@@ -79,11 +79,16 @@ survives restarts and is trimmed after ~26 hours.
 ### Usage
 
 ```sh
-python claude_usage.py                 # refresh every 30s
-python claude_usage.py --interval 10   # refresh every 10s
+python claude_usage.py                 # refresh every 60s
+python claude_usage.py --interval 120  # refresh every 2 minutes
 ```
 
-Ctrl+C to quit. Reset times are shown in your local timezone.
+Ctrl+C to quit. Reset times are shown in your local timezone. The default
+interval is a polite once-a-minute — the endpoint is rate limited, so don't
+crank it down hard. Transient HTTP/network errors are silent: the last good
+display stays up (the `updated` timestamp shows its age) and the next
+successful poll refreshes it. Only an expired token shows a hint, since that
+needs you to open Claude Code once.
 
 ### Notes
 

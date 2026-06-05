@@ -2,7 +2,7 @@
 """Live Claude usage monitor.
 
 Reads the Claude Code OAuth token from ~/.claude/.credentials.json and polls
-the usage endpoint every 30 seconds, showing session / weekly limits, when
+the usage endpoint every minute, showing session / weekly limits, when
 they reset, usage over the last 15/30/60 minutes, and a burn-rate forecast:
 will the current pace bust a limit before it resets, and how much to slow
 down to ride it out. Stdlib only - no pip installs needed.
@@ -218,31 +218,39 @@ def render(data, history=None, now_ts=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Live Claude usage monitor")
-    parser.add_argument("--interval", type=int, default=30, help="refresh seconds (default 30)")
+    parser.add_argument("--interval", type=int, default=60,
+                        help="refresh seconds (default 60 - the API is rate "
+                             "limited, be polite)")
     args = parser.parse_args()
 
     os.system("")  # enable ANSI escape codes on Windows consoles
     history = load_history()
+    last_good = None  # transient errors keep the previous display up
 
     while True:
+        status = None
         try:
             # re-read each poll: Claude Code rotates this token when it refreshes
             data = fetch_usage(read_token())
             now_ts = time.time()
             history = record_sample(history, data, now_ts)
             save_history(history)
-            sys.stdout.write("\x1b[2J\x1b[H" + render(data, history, now_ts) + "\n")
-            sys.stdout.flush()
+            last_good = render(data, history, now_ts)
         except urllib.error.HTTPError as e:
+            # quietly keep the last display; only a dead token needs the user
             if e.code == 401:
-                print("\nToken expired/invalid. Open Claude Code once (it refreshes "
-                      "the token automatically), then this will recover.")
-            else:
-                print(f"\nHTTP {e.code} from usage endpoint - retrying in {args.interval}s")
+                status = ("token expired - open Claude Code once to refresh it, "
+                          "this will recover by itself")
         except FileNotFoundError:
-            print(f"\nNo credentials at {CREDS_PATH} - is Claude Code logged in?")
+            status = f"no credentials at {CREDS_PATH} - is Claude Code logged in?"
         except (urllib.error.URLError, TimeoutError):
-            print(f"\nNetwork error - retrying in {args.interval}s")
+            pass  # network blip - the stale 'updated' header says it all
+
+        screen = last_good or f"{DIM}waiting for first response...{RESET}"
+        if status:
+            screen += f"\n  {DIM}{status}{RESET}"
+        sys.stdout.write("\x1b[2J\x1b[H" + screen + "\n")
+        sys.stdout.flush()
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:
