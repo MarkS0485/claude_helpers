@@ -1,0 +1,29 @@
+# Dependabot — tuned aggressive: checks DAILY, allows every update type
+# (including majors), and lifts the open-PR cap so nothing is held back. CI
+# runs on each PR, and patch/minor bumps auto-merge once green (see
+# .github/workflows/dependabot-auto-merge.yml).
+#
+# Ecosystems covered:
+#   * github-actions — the action versions pinned in .github/workflows/*.
+#
+# The Python scripts here are stdlib-only by design — no requirements.txt /
+# pyproject, so there is no pip ecosystem to watch. Add one if a script ever
+# grows a real dependency.
+#
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  # ------------------------------------------------------ GitHub Actions ---
+  - package-ecosystem: "github-actions"
+    directory: "/"                  # scans .github/workflows/
+    schedule:
+      interval: "daily"
+    open-pull-requests-limit: 20
+    groups:
+      github-actions-all:           # checkout, setup-python, … all in one PR
+        patterns: ["*"]
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    assignees: ["MarkS0485"]
