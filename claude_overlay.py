@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Neon Claude usage overlay for the Windows taskbar (or any screen edge).
+"""Neon Claude usage overlay for the Windows taskbar (or any screen edges).
 
-A strip a few pixels thick pinned to a screen edge - by default the bottom,
-sitting just above the taskbar - always on top, split into three equal
-segments:
+Strips a few pixels thick pinned to one or more screen edges - by default
+the bottom, sitting just above the taskbar - always on top, each split into
+three equal segments:
 
     Session (5h)        |  Weekly (all)        |  Weekly Opus
 
@@ -14,10 +14,16 @@ the limit you are. Any segment at >=90% pulses. Hover for the exact numbers
 and reset time; right-click to refresh or quit. Uses the same endpoint and
 credentials as claude_usage.py - stdlib only, no pip installs.
 
---edge top|bottom|left|right pins it to any display edge, Samsung-Edge
-style. Side strips stack the segments bottom-up and their bars fill
-upwards; the top strip is the bottom one mirrored (bottom-left segment
-lands top-right, the middle stays the middle).
+--edge picks which edges to draw, Samsung-Edge style:
+
+    0 bottom   1 top   2 left   3 right
+    4 all four   5 left+right   6 top+bottom
+
+(the names bottom/top/left/right are also accepted). Side strips stack the
+segments bottom-up and their bars fill upwards; the top strip is the bottom
+one mirrored (bottom-left segment lands top-right, the middle stays the
+middle). When sides and top/bottom are shown together the sides give way at
+the corners.
 
 The launched process is a tiny supervisor: the actual overlay runs as a
 child that gets restarted automatically (with backoff) if it ever dies.
@@ -25,7 +31,7 @@ Right-click -> Quit stops both. Crashes and callback errors are appended to
 ~/.claude_overlay.log so failures leave a trail.
 
 Usage:  python claude_overlay.py [--interval SECONDS] [--thickness PIXELS]
-                                 [--edge bottom|top|left|right]
+                                 [--edge 0-6]
         (use pythonw instead of python to run without a console window)
 """
 
@@ -60,6 +66,15 @@ STALE_BRIGHTNESS = 1.0 / 3.0  # missed-polls look
 STALE_POLLS = 3       # missed polls before the colours dim
 
 EDGES = ("bottom", "top", "left", "right")
+EDGE_MODES = {
+    "0": ("bottom",),
+    "1": ("top",),
+    "2": ("left",),
+    "3": ("right",),
+    "4": ("bottom", "top", "left", "right"),
+    "5": ("left", "right"),
+    "6": ("top", "bottom"),
+}
 
 LOG_PATH = os.path.expanduser("~/.claude_overlay.log")
 LOG_MAX_BYTES = 256 * 1024  # rotate to .1 beyond this
@@ -82,6 +97,16 @@ def log_line(text):
 
 
 # --- pure helpers (unit tested, no GUI) -----------------------------------
+
+def parse_edges(value):
+    """'0'..'6' preset (or a bare edge name) -> tuple of edges to draw."""
+    v = str(value).strip().lower()
+    if v in EDGE_MODES:
+        return EDGE_MODES[v]
+    if v in EDGES:
+        return (v,)
+    raise ValueError("unknown edge mode: {!r}".format(value))
+
 
 def pick_buckets(data):
     """First three buckets present and non-null, in BUCKETS order."""
@@ -151,6 +176,19 @@ def axis_to_canvas(edge, span, a0, a1):
     return span - a1, span - a0
 
 
+def inset_area(area, edges, edge, thickness):
+    """Work area available to `edge`'s strip: when top/bottom strips are
+    also being drawn, the side strips give way at the corners so the strips
+    never overlap."""
+    left, top, right, bottom = area
+    if edge in ("left", "right"):
+        if "top" in edges:
+            top += thickness
+        if "bottom" in edges:
+            bottom -= thickness
+    return left, top, right, bottom
+
+
 def geometry_for(edge, area, thickness):
     """(width, height, x, y) pinning a `thickness` px strip to one edge of
     the (left, top, right, bottom) work area."""
@@ -198,125 +236,53 @@ def work_area(root):
     return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
 
 
-# --- the overlay -----------------------------------------------------------
+# --- one strip on one edge --------------------------------------------------
 
-class Overlay:
-    def __init__(self, root, interval, thickness, edge):
-        self.root = root
-        self.interval = interval
-        self.thickness = thickness
+class Strip:
+    """A single borderless always-on-top window on one screen edge."""
+
+    def __init__(self, app, edge):
+        self.app = app
         self.edge = edge
         self.horizontal = edge in ("top", "bottom")
-        self.lock = threading.Lock()
-        self.wake = threading.Event()
-        self.data = None
-        self.fetched_ts = 0.0
-        self.status = None
         self.geometry = None
-        self.span = 0   # strip length along its long axis
+        self.span = 0   # strip length along its fill axis
         self.render_key = None
         self.hits = []  # [(a0, a1, label, bucket)] for the hover tooltip
+        self.tip = None
 
-        root.overrideredirect(True)          # no border, no title bar
-        root.attributes("-topmost", True)
+        win = tk.Toplevel(app.root)
+        win.overrideredirect(True)           # no border, no title bar
+        win.attributes("-topmost", True)
         try:
-            root.attributes("-toolwindow", True)  # keep out of Alt-Tab
+            win.attributes("-toolwindow", True)  # keep out of Alt-Tab
         except tk.TclError:
             pass
-        # callback errors otherwise vanish (pythonw has no stderr) - log them
-        root.report_callback_exception = self.on_callback_error
+        self.win = win
 
-        self.canvas = tk.Canvas(root, highlightthickness=0, bd=0, bg=BG)
+        self.canvas = tk.Canvas(win, highlightthickness=0, bd=0, bg=BG)
         self.canvas.pack(fill="both", expand=True)
-
-        self.tip = None
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<Leave>", lambda e: self.hide_tip())
-        menu = tk.Menu(root, tearoff=0)
-        menu.add_command(label="Refresh now", command=self.wake.set)
-        menu.add_separator()
-        menu.add_command(label="Quit overlay", command=root.destroy)
         self.canvas.bind("<Button-3>",
-                         lambda e: menu.tk_popup(e.x_root, e.y_root))
+                         lambda e: app.menu.tk_popup(e.x_root, e.y_root))
 
-        threading.Thread(target=self.poll_loop, daemon=True).start()
-        self.place()
-        self.tick()
+    # -- geometry / drawing --
 
-    def on_callback_error(self, exc_type, exc, tb):
-        log_line("callback error: " + "".join(
-            traceback.format_exception(exc_type, exc, tb)).strip())
-
-    # -- polling (background thread) --
-
-    def poll_loop(self):
-        while True:
-            status = None
-            try:
-                # re-read each poll: Claude Code rotates the token
-                data = fetch_usage(read_token())
-                with self.lock:
-                    self.data = data
-                    self.fetched_ts = time.time()
-            except urllib.error.HTTPError as e:
-                if e.code == 401:
-                    status = ("token expired - open Claude Code once "
-                              "to refresh it")
-            except FileNotFoundError:
-                status = "no credentials - is Claude Code logged in?"
-            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
-                pass  # network blip - the bar dims if it goes on too long
-            except Exception:  # anything else must not kill the thread
-                log_line("poll error: " + traceback.format_exc())
-            with self.lock:
-                self.status = status
-            self.wake.wait(self.interval)
-            self.wake.clear()
-
-    # -- geometry / drawing (UI thread) --
-
-    def place(self):
-        """Pin to the chosen edge of the work area (so the bottom edge sits
-        just above the taskbar). Re-checked every tick to follow a moved or
-        resized taskbar."""
-        w, h, x, y = geometry_for(self.edge, work_area(self.root),
-                                  self.thickness)
+    def place(self, area):
+        """Pin to this strip's edge of the work area (so the bottom strip
+        sits just above the taskbar). Re-checked every tick to follow a
+        moved or resized taskbar."""
+        area = inset_area(area, self.app.edges, self.edge,
+                          self.app.thickness)
+        w, h, x, y = geometry_for(self.edge, area, self.app.thickness)
         geometry = "{}x{}+{}+{}".format(w, h, x, y)
         if geometry != self.geometry:
             self.geometry = geometry
             self.span = w if self.horizontal else h
-            self.root.geometry(geometry)
+            self.win.geometry(geometry)
 
-    def tick(self):
-        """1s heartbeat. Must survive anything: if this loop dies the strip
-        stops re-asserting topmost and quietly disappears behind other
-        windows - which is a crash as far as the user can tell."""
-        try:
-            self.place()
-            self.redraw()
-            if self.root.state() != "normal":
-                self.root.deiconify()  # something hid us - come back
-            self.root.lift()
-            self.root.attributes("-topmost", True)
-        except tk.TclError:
-            pass  # Tk mid-shutdown or in a bad state; next tick retries
-        except Exception:
-            log_line("tick error: " + traceback.format_exc())
-        finally:
-            try:
-                self.root.after(1000, self.tick)
-            except tk.TclError:
-                pass  # window destroyed - we're quitting
-
-    def redraw(self):
-        with self.lock:
-            data, fetched_ts = self.data, self.fetched_ts
-        stale = bool(fetched_ts) and (
-            time.time() - fetched_ts > self.interval * STALE_POLLS)
-        picked = pick_buckets(data)
-        pcts = tuple(b.get("utilization") or 0.0 for _, _, b in picked)
-        # the 1s tick drives the alert pulse; otherwise hold the phase still
-        phase = int(time.time()) % 2 if any(p >= ALERT_AT for p in pcts) else 0
+    def redraw(self, picked, pcts, stale, phase):
         render_key = (self.span, stale, phase, pcts)
         if render_key == self.render_key:
             return  # nothing moved - skip repainting the gradient runs
@@ -345,11 +311,17 @@ class Overlay:
         """Filled rectangle spanning [a0, a1) on the strip's fill axis."""
         c0, c1 = axis_to_canvas(self.edge, self.span, a0, a1)
         if self.horizontal:
-            self.canvas.create_rectangle(c0, 0, c1, self.thickness,
+            self.canvas.create_rectangle(c0, 0, c1, self.app.thickness,
                                          fill=colour, width=0)
         else:
-            self.canvas.create_rectangle(0, c0, self.thickness, c1,
+            self.canvas.create_rectangle(0, c0, self.app.thickness, c1,
                                          fill=colour, width=0)
+
+    def assert_visible(self):
+        if self.win.state() != "normal":
+            self.win.deiconify()  # something hid us - come back
+        self.win.lift()
+        self.win.attributes("-topmost", True)
 
     # -- hover tooltip --
 
@@ -365,8 +337,7 @@ class Overlay:
     def tip_info(self, pos):
         """(text, colour) for the segment under `pos` - text in the same
         green->red severity colour as the tip of that segment's bar."""
-        with self.lock:
-            fetched_ts, status = self.fetched_ts, self.status
+        fetched_ts, status = self.app.snapshot_status()
         for a0, a1, label, bucket in self.hits:
             if a0 <= pos < a1:
                 pct = bucket.get("utilization") or 0.0
@@ -387,7 +358,7 @@ class Overlay:
 
     def show_tip(self, event, text, fg):
         if self.tip is None:
-            self.tip = tk.Toplevel(self.root)
+            self.tip = tk.Toplevel(self.win)
             self.tip.overrideredirect(True)
             self.tip.attributes("-topmost", True)
             self.tip_label = tk.Label(
@@ -398,23 +369,119 @@ class Overlay:
         self.tip.update_idletasks()
         w = self.tip.winfo_reqwidth()
         h = self.tip.winfo_reqheight()
-        margin = self.thickness + 6
+        margin = self.app.thickness + 6
         if self.edge == "bottom":
-            x, y = event.x_root - w // 2, self.root.winfo_rooty() - h - 6
+            x, y = event.x_root - w // 2, self.win.winfo_rooty() - h - 6
         elif self.edge == "top":
-            x, y = event.x_root - w // 2, self.root.winfo_rooty() + margin
+            x, y = event.x_root - w // 2, self.win.winfo_rooty() + margin
         elif self.edge == "left":
-            x, y = self.root.winfo_rootx() + margin, event.y_root - h // 2
+            x, y = self.win.winfo_rootx() + margin, event.y_root - h // 2
         else:  # right
-            x, y = self.root.winfo_rootx() - w - 6, event.y_root - h // 2
-        x = min(max(x, 0), max(self.root.winfo_screenwidth() - w, 0))
-        y = min(max(y, 0), max(self.root.winfo_screenheight() - h, 0))
+            x, y = self.win.winfo_rootx() - w - 6, event.y_root - h // 2
+        x = min(max(x, 0), max(self.win.winfo_screenwidth() - w, 0))
+        y = min(max(y, 0), max(self.win.winfo_screenheight() - h, 0))
         self.tip.geometry("+{}+{}".format(x, y))
         self.tip.deiconify()
 
     def hide_tip(self):
         if self.tip is not None:
             self.tip.withdraw()
+
+
+# --- the overlay app --------------------------------------------------------
+
+class Overlay:
+    """Shared poll loop + heartbeat driving one Strip per configured edge."""
+
+    def __init__(self, root, interval, thickness, edges):
+        self.root = root
+        self.interval = interval
+        self.thickness = thickness
+        self.edges = edges
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.data = None
+        self.fetched_ts = 0.0
+        self.status = None
+
+        root.withdraw()  # the strips are Toplevels; the root stays hidden
+        # callback errors otherwise vanish (pythonw has no stderr) - log them
+        root.report_callback_exception = self.on_callback_error
+
+        self.menu = tk.Menu(root, tearoff=0)
+        self.menu.add_command(label="Refresh now", command=self.wake.set)
+        self.menu.add_separator()
+        self.menu.add_command(label="Quit overlay", command=root.destroy)
+
+        self.strips = [Strip(self, edge) for edge in edges]
+
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+        self.tick()
+
+    def on_callback_error(self, exc_type, exc, tb):
+        log_line("callback error: " + "".join(
+            traceback.format_exception(exc_type, exc, tb)).strip())
+
+    def snapshot_status(self):
+        with self.lock:
+            return self.fetched_ts, self.status
+
+    # -- polling (background thread) --
+
+    def poll_loop(self):
+        while True:
+            status = None
+            try:
+                # re-read each poll: Claude Code rotates the token
+                data = fetch_usage(read_token())
+                with self.lock:
+                    self.data = data
+                    self.fetched_ts = time.time()
+            except urllib.error.HTTPError as e:
+                if e.code == 401:
+                    status = ("token expired - open Claude Code once "
+                              "to refresh it")
+            except FileNotFoundError:
+                status = "no credentials - is Claude Code logged in?"
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                pass  # network blip - the bars dim if it goes on too long
+            except Exception:  # anything else must not kill the thread
+                log_line("poll error: " + traceback.format_exc())
+            with self.lock:
+                self.status = status
+            self.wake.wait(self.interval)
+            self.wake.clear()
+
+    # -- heartbeat (UI thread) --
+
+    def tick(self):
+        """1s heartbeat. Must survive anything: if this loop dies the strips
+        stop re-asserting topmost and quietly disappear behind other
+        windows - which is a crash as far as the user can tell."""
+        try:
+            with self.lock:
+                data, fetched_ts = self.data, self.fetched_ts
+            stale = bool(fetched_ts) and (
+                time.time() - fetched_ts > self.interval * STALE_POLLS)
+            picked = pick_buckets(data)
+            pcts = tuple(b.get("utilization") or 0.0 for _, _, b in picked)
+            # this tick drives the alert pulse; otherwise hold the phase
+            phase = (int(time.time()) % 2
+                     if any(p >= ALERT_AT for p in pcts) else 0)
+            area = work_area(self.root)
+            for strip in self.strips:
+                strip.place(area)
+                strip.redraw(picked, pcts, stale, phase)
+                strip.assert_visible()
+        except tk.TclError:
+            pass  # Tk mid-shutdown or in a bad state; next tick retries
+        except Exception:
+            log_line("tick error: " + traceback.format_exc())
+        finally:
+            try:
+                self.root.after(1000, self.tick)
+            except tk.TclError:
+                pass  # window destroyed - we're quitting
 
 
 # --- supervisor ------------------------------------------------------------
@@ -445,17 +512,28 @@ def supervise():
         delay = min(delay * 2, RESTART_DELAY_MAX)
 
 
+def edge_arg(value):
+    try:
+        return parse_edges(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "use 0=bottom 1=top 2=left 3=right 4=all 5=left+right "
+            "6=top+bottom (or an edge name)")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Neon Claude usage overlay pinned to a screen edge")
+        description="Neon Claude usage overlay pinned to screen edges")
     parser.add_argument("--interval", type=int, default=60,
                         help="refresh seconds (default 60 - the API is rate "
                              "limited, be polite)")
     parser.add_argument("--thickness", type=int, default=4,
                         help="bar thickness in pixels (default 4)")
-    parser.add_argument("--edge", choices=EDGES, default="bottom",
-                        help="screen edge to pin to (default bottom, i.e. "
-                             "just above the taskbar)")
+    parser.add_argument("--edge", type=edge_arg, default=("bottom",),
+                        metavar="MODE",
+                        help="edges to draw: 0=bottom (default, just above "
+                             "the taskbar) 1=top 2=left 3=right 4=all "
+                             "5=left+right 6=top+bottom")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 

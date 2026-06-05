@@ -73,6 +73,54 @@ class FillWidthTests(unittest.TestCase):
         self.assertEqual(co.fill_width(-5, 600), 0)
 
 
+class ParseEdgesTests(unittest.TestCase):
+    def test_numeric_modes(self):
+        self.assertEqual(co.parse_edges("0"), ("bottom",))
+        self.assertEqual(co.parse_edges("1"), ("top",))
+        self.assertEqual(co.parse_edges("2"), ("left",))
+        self.assertEqual(co.parse_edges("3"), ("right",))
+        self.assertEqual(co.parse_edges("4"),
+                         ("bottom", "top", "left", "right"))
+        self.assertEqual(co.parse_edges("5"), ("left", "right"))
+        self.assertEqual(co.parse_edges("6"), ("top", "bottom"))
+
+    def test_names_still_accepted(self):
+        self.assertEqual(co.parse_edges("bottom"), ("bottom",))
+        self.assertEqual(co.parse_edges("RIGHT"), ("right",))
+
+    def test_unknown_raises(self):
+        for bad in ("7", "-1", "diagonal", ""):
+            with self.assertRaises(ValueError):
+                co.parse_edges(bad)
+
+
+class InsetAreaTests(unittest.TestCase):
+    AREA = (0, 0, 2560, 1380)
+
+    def test_sides_give_way_to_top_and_bottom(self):
+        all_edges = ("bottom", "top", "left", "right")
+        self.assertEqual(co.inset_area(self.AREA, all_edges, "left", 4),
+                         (0, 4, 2560, 1376))
+        self.assertEqual(co.inset_area(self.AREA, all_edges, "right", 4),
+                         (0, 4, 2560, 1376))
+
+    def test_horizontal_strips_never_inset(self):
+        all_edges = ("bottom", "top", "left", "right")
+        self.assertEqual(co.inset_area(self.AREA, all_edges, "bottom", 4),
+                         self.AREA)
+        self.assertEqual(co.inset_area(self.AREA, all_edges, "top", 4),
+                         self.AREA)
+
+    def test_lone_side_keeps_full_height(self):
+        self.assertEqual(co.inset_area(self.AREA, ("left",), "left", 4),
+                         self.AREA)
+
+    def test_side_with_only_bottom(self):
+        self.assertEqual(
+            co.inset_area(self.AREA, ("bottom", "right"), "right", 4),
+            (0, 0, 2560, 1376))
+
+
 class GeometryForTests(unittest.TestCase):
     AREA = (0, 0, 2560, 1380)  # 2560x1440 screen, 60px taskbar at the bottom
 
