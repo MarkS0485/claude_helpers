@@ -2,6 +2,36 @@
 
 Small utilities for working with Claude / Claude Code.
 
+## claude_config.py — configure Claude Code from the command line
+
+Manages `~/.claude/settings.json`: permission bypass mode, environment
+variables injected into every Claude Code session (GitHub PAT etc.), the git
+SSH identity, and SSH host entries.
+
+```sh
+python claude_config.py show                    # current config, secrets masked
+python claude_config.py bypass on               # run without permission prompts (confirms first)
+python claude_config.py bypass off
+python claude_config.py env GH_TOKEN            # set a session env var - value typed hidden
+python claude_config.py env GH_TOKEN --from-env # ...or copied from the current environment
+python claude_config.py env GH_TOKEN --delete
+python claude_config.py ssh-key C:\Users\me\.ssh\id_ed25519   # git ssh identity
+python claude_config.py ssh list
+python claude_config.py ssh add --id ovh --host ubuntu@1.2.3.4 --key C:\Users\me\.ssh\ovh_ed25519
+python claude_config.py ssh remove ovh
+```
+
+Secret handling: values are entered with hidden input (or pulled from your
+environment), written **only** to your local `settings.json`, and echoed back
+masked (`ghp_********`). `show` masks anything whose name looks secret
+(TOKEN/KEY/PAT/SECRET/...). Every write keeps a `settings.json.bak` of the
+previous version and other settings are preserved untouched. Use
+`--settings PATH` to operate on a different file (e.g. a test copy).
+
+> **Note:** `bypass on` lets Claude Code run commands and edit files without
+> asking. Only enable it if you understand what that means; the command asks
+> for confirmation unless you pass `--yes`.
+
 ## claude_usage.py — live usage monitor
 
 A terminal dashboard showing your Claude subscription usage — session (5-hour)
