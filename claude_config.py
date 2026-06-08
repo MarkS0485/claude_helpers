@@ -19,19 +19,26 @@ Usage:
   python claude_config.py ssh list                      configured SSH hosts
   python claude_config.py ssh add --id NAME --host USER@HOST --key PATH [--name LABEL]
   python claude_config.py ssh remove ID
+  python claude_config.py ssh import                    register ~/.ssh hosts & keys
+  python claude_config.py tokens                        list token env vars (masked)
 """
 
 import argparse
 import copy
 import getpass
+import glob
 import json
 import os
 import sys
 
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+SSH_DIR = os.path.expanduser("~/.ssh")
 
 # env-var names containing any of these are masked by `show`
 SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PAT", "PASSWORD", "CREDENTIAL", "AUTH")
+
+# env vars the estate expects for pushing / packaging
+EXPECTED_TOKENS = ("GH_TOKEN", "NUGET_API_KEY")
 
 
 # --------------------------------------------------------------- file I/O ---
@@ -124,6 +131,109 @@ def remove_ssh_host(settings, host_id):
     return settings
 
 
+# ----------------------------------------------------- ssh import (pure) ---
+
+def parse_ssh_config(text):
+    """Parse an ssh config into a list of {host, hostname, user, identityfile}
+    blocks (one per `Host` stanza; wildcard '*' hosts are skipped)."""
+    blocks = []
+    current = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts[0].lower(), parts[1].strip()
+        if key == "host":
+            if current is not None:
+                blocks.append(current)
+            current = {"host": value, "hostname": None,
+                       "user": None, "identityfile": None}
+        elif current is None:
+            continue
+        elif key == "hostname":
+            current["hostname"] = value
+        elif key == "user":
+            current["user"] = value
+        elif key == "identityfile":
+            current["identityfile"] = os.path.expanduser(value)
+    if current is not None:
+        blocks.append(current)
+    return [b for b in blocks if "*" not in b["host"]]
+
+
+def ssh_host_string(block):
+    """user@hostname (or just hostname) from a parsed config block."""
+    host = block.get("hostname") or block["host"]
+    user = block.get("user")
+    return f"{user}@{host}" if user else host
+
+
+def _config_id(block):
+    return block["host"]
+
+
+def import_ssh_entries(settings, config_blocks, pub_keys):
+    """Merge ssh config blocks + pub-key files into settings['sshConfigs'],
+    idempotently (match by id or by identity file). Returns (settings, added)
+    where added is a list of the ids newly registered.
+
+    - Each config block becomes an entry keyed by its Host alias.
+    - Each *.pub with no matching Host block (by private-key path) becomes a
+      placeholder entry (sshHost 'TODO@TODO') flagging it needs a host.
+    """
+    configs = settings.setdefault("sshConfigs", [])
+    existing_ids = {c.get("id") for c in configs}
+    existing_keys = {os.path.normcase(os.path.normpath(c["sshIdentityFile"]))
+                     for c in configs if c.get("sshIdentityFile")}
+    added = []
+
+    def norm(p):
+        return os.path.normcase(os.path.normpath(p)) if p else None
+
+    # config blocks first (they carry a real host)
+    config_key_paths = set()
+    for block in config_blocks:
+        host_id = _config_id(block)
+        ident = block.get("identityfile")
+        if ident:
+            config_key_paths.add(norm(ident))
+        if host_id in existing_ids or (ident and norm(ident) in existing_keys):
+            continue
+        configs.append({
+            "id": host_id,
+            "name": host_id,
+            "sshHost": ssh_host_string(block),
+            "sshIdentityFile": ident or "",
+        })
+        existing_ids.add(host_id)
+        if ident:
+            existing_keys.add(norm(ident))
+        added.append(host_id)
+
+    # public keys with no matching Host block -> placeholder entries
+    for pub in pub_keys:
+        priv = pub[:-4] if pub.endswith(".pub") else pub  # strip .pub
+        key_id = os.path.basename(priv)
+        if norm(priv) in config_key_paths or norm(priv) in existing_keys:
+            continue
+        if key_id in existing_ids:
+            continue
+        configs.append({
+            "id": key_id,
+            "name": f"{key_id} (needs a host - set sshHost)",
+            "sshHost": "TODO@TODO",
+            "sshIdentityFile": priv,
+        })
+        existing_ids.add(key_id)
+        existing_keys.add(norm(priv))
+        added.append(key_id)
+
+    return settings, added
+
+
 # ----------------------------------------------------------------- display ---
 
 def is_secret_name(name):
@@ -147,6 +257,14 @@ def masked_view(settings):
         if is_secret_name(name):
             view["env"][name] = mask(value)
     return view
+
+
+def token_entries(settings):
+    """Token-like env entries as (name, masked_value) pairs, name-sorted.
+    Never returns raw secret values."""
+    env = settings.get("env", {})
+    return [(name, mask(env[name]))
+            for name in sorted(env) if is_secret_name(name)]
 
 
 # -------------------------------------------------------------------- CLI ---
@@ -187,6 +305,12 @@ def main():
     pa.add_argument("--name", help="display label (defaults to id)")
     pr = ssh_sub.add_parser("remove")
     pr.add_argument("id")
+    pi = ssh_sub.add_parser(
+        "import", help="register ~/.ssh/config hosts and *.pub keys")
+    pi.add_argument("--ssh-dir", default=SSH_DIR,
+                    help="ssh directory to read (default: %(default)s)")
+
+    sub.add_parser("tokens", help="list token env vars (masked) + expected set")
 
     args = parser.parse_args()
     settings = load_settings(args.settings)
@@ -255,6 +379,42 @@ def main():
             save_settings(settings, args.settings)
             print(f"removed ssh host '{args.id}'")
             return
+        if args.ssh_command == "import":
+            cfg_path = os.path.join(args.ssh_dir, "config")
+            blocks = []
+            if os.path.exists(cfg_path):
+                with open(cfg_path, encoding="utf-8") as f:
+                    blocks = parse_ssh_config(f.read())
+            pubs = sorted(glob.glob(os.path.join(args.ssh_dir, "*.pub")))
+            _, added = import_ssh_entries(settings, blocks, pubs)
+            if added:
+                save_settings(settings, args.settings)
+                print(f"registered {len(added)} ssh entr"
+                      f"{'y' if len(added) == 1 else 'ies'}: "
+                      + ", ".join(added))
+                placeholders = [c for c in settings.get("sshConfigs", [])
+                                if c.get("id") in added
+                                and c.get("sshHost") == "TODO@TODO"]
+                for c in placeholders:
+                    print(f"  NOTE: '{c['id']}' has no Host block - "
+                          "set sshHost before use")
+            else:
+                print("nothing to import - all ssh entries already registered")
+            return
+
+    if args.command == "tokens":
+        print(f"# token env vars in {args.settings} (masked)")
+        entries = token_entries(settings)
+        if entries:
+            for name, masked in entries:
+                print(f"  {name} = {masked}")
+        else:
+            print("  (none)")
+        print("# expected:")
+        env = settings.get("env", {})
+        for name in EXPECTED_TOKENS:
+            print(f"  {name}: {'present' if name in env else 'MISSING'}")
+        return
 
 
 if __name__ == "__main__":

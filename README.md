@@ -19,7 +19,21 @@ python claude_config.py ssh-key C:\Users\me\.ssh\id_ed25519   # git ssh identity
 python claude_config.py ssh list
 python claude_config.py ssh add --id ovh --host ubuntu@1.2.3.4 --key C:\Users\me\.ssh\ovh_ed25519
 python claude_config.py ssh remove ovh
+python claude_config.py ssh import            # register ~/.ssh/config hosts + *.pub keys
+python claude_config.py tokens                # list token env vars (masked) + expected set
 ```
+
+`ssh import` parses `~/.ssh/config` (`Host`/`HostName`/`User`/`IdentityFile`)
+and enumerates `~/.ssh/*.pub`, merging each into `sshConfigs` idempotently
+(matched by id or identity-file, so re-running adds nothing new). A private key
+with no matching `Host` block (e.g. `hyperstack_canada`) is registered with a
+`TODO@TODO` placeholder host flagged as needing one. Use `--ssh-dir PATH` to
+read a different directory.
+
+`tokens` lists the token-like env vars (TOKEN/KEY/SECRET/PAT/PASSWORD/...)
+masked the same way as `show`, then reports whether each expected token
+(`GH_TOKEN`, `NUGET_API_KEY`) is present or MISSING. Raw values are never
+printed.
 
 Secret handling: values are entered with hidden input (or pulled from your
 environment), written **only** to your local `settings.json`, and echoed back
@@ -31,6 +45,66 @@ previous version and other settings are preserved untouched. Use
 > **Note:** `bypass on` lets Claude Code run commands and edit files without
 > asking. Only enable it if you understand what that means; the command asks
 > for confirmation unless you pass `--yes`.
+
+## claude_projects.py — project registry, notes & git-sync for the estate
+
+Maintains `_claude\projects.json` (the machine-readable registry of every
+project in the `D:\claude` estate — the single source of truth) and
+re-renders `_claude\REGISTRY.md` from it. It also keeps per-project notes and
+plans, dated session logs, reports git status across every repo, and
+pushes/checkpoints them under the estate's rules (Conventional-Commits
+subjects, author `MarkS0485`, **no AI attribution**, never `--no-verify`).
+
+The estate root defaults to `D:\claude` (override with `--root` or env
+`CLAUDE_ESTATE_ROOT`); the workspace is `<root>\_claude` (override with
+`--workspace`). Hand-authored logical data (type/work/group/parent/links/
+description/notes/flags/children) is never destroyed by `scan` — only
+discoverable git facts (remote, branch, on-disk presence) are refreshed.
+
+```sh
+python claude_projects.py scan                 # reconcile registry with disk (dry run)
+python claude_projects.py scan --write         # ...and persist refreshed facts + re-render
+python claude_projects.py list                 # the work -> group -> node tree
+python claude_projects.py list --work jack      # only that work's subtree
+python claude_projects.py list --links          # the relationship graph (one line per edge)
+python claude_projects.py add foo --name Foo --type code --work tsgb --group radio \
+    --path Foo --remote git@github.com:MarkS0485/Foo.git --description "a thing"
+python claude_projects.py remove foo            # drop a node, strip it from children, warn on dangling links
+python claude_projects.py link app lib --type consumes-nuget --note "PackageReference"
+python claude_projects.py unlink app lib --type consumes-nuget
+python claude_projects.py links gda             # inbound + outbound links for a node
+python claude_projects.py note gda "rebased onto v2 layout"   # append a timestamped note line
+python claude_projects.py note gda --show        # print the notes file
+python claude_projects.py plan gridsim add plans/replay-plan.md
+python claude_projects.py plan gridsim list
+python claude_projects.py status                 # dirty / ahead / behind / upstream per repo
+python claude_projects.py push gda -m "fix: correct ingest window"   # commit (if dirty) + push one repo
+python claude_projects.py push --all             # push every repo node
+python claude_projects.py sync                   # push already-committed-but-unpushed repos; list dirty ones
+python claude_projects.py log "finished the render parity work"   # append to today's session log
+python claude_projects.py log --resume           # print the latest session, highlighting next/resume lines
+python claude_projects.py hooks --all            # install the no-attribution commit-msg hook into every repo
+python claude_projects.py render                 # regenerate REGISTRY.md from projects.json
+```
+
+- **scan** walks every top-level dir under the root plus every node's path
+  (catching nested sub-projects like `GDA/v1/Applications/RoCoF-App`),
+  detects git repos, refreshes remote/branch/presence, and reports drift
+  (missing paths, unregistered repos, classification of unknown dirs). It
+  validates the rule *code never contains work* and flags dangling
+  parents / children / link targets. Nothing is written without `--write`.
+- **push / sync** skip nodes flagged `never-push`/`no-remote`. For
+  `https://github.com/...` remotes, if `GH_TOKEN` is set the push uses a
+  transient `x-access-token` URL computed on the fly — the token is never
+  written into `.git/config` or printed. SSH remotes push normally.
+  `sync` is a checkpoint: it pushes repos that are ahead but **never invents
+  commit messages** for dirty trees — those are listed for an explicit
+  `push -m`.
+- **hooks** installs the `commit-msg` hook that strips any `Co-Authored-By:
+  …Claude`, `noreply@anthropic.com`, or "Generated with [Claude Code]" lines,
+  resolving a `gitdir:` pointer when `.git` is a worktree file.
+- **render** is deterministic and reproduces `REGISTRY.md` exactly (members
+  sorted by name; explicit `children[]` order preserved).
 
 ## claude_usage.py — live usage monitor
 
