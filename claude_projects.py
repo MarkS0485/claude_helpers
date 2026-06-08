@@ -829,6 +829,14 @@ def push_repo(node, root, msg=None):
         rc, _, err = run_git(["push", "origin", branch], cwd=path)
     if rc != 0:
         return f"{node['name']}: push failed - {err}"
+    if used_token:
+        # We pushed to a tokenised URL, not the named remote, so git did not
+        # advance refs/remotes/origin/<branch>. Update it ourselves so status
+        # and sync stay accurate (the token never touches .git/config).
+        head_rc, head_out, _ = run_git(["rev-parse", "HEAD"], cwd=path)
+        if head_rc == 0:
+            run_git(["update-ref", f"refs/remotes/origin/{branch}",
+                     head_out.strip()], cwd=path)
     return f"{node['name']}: pushed {branch}"
 
 
