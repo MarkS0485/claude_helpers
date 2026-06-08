@@ -129,6 +129,37 @@ def fill_width(pct, seg_width):
     return round(seg_width * min(max(pct, 0.0), 100.0) / 100.0)
 
 
+def parse_reset(value):
+    """`resets_at` -> aware datetime, or None if missing/unparseable. The API
+    occasionally hands back a null reset time alongside a live utilisation
+    (notably around rate limits and timeouts), so the tooltip must never
+    assume it is always a parseable string."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).astimezone()
+    except ValueError:
+        return None
+
+
+def freshness_line(fetched_ts, status, interval, now=None):
+    """One-line freshness note for the tooltip. An explicit status (token
+    expired, no credentials) wins; otherwise show when the figures were last
+    fetched - flagged as cached once they are older than a refresh and a half,
+    so a hover during a timeout still shows the last value with a hint that
+    it's stale rather than vanishing."""
+    if status:
+        return status
+    if not fetched_ts:
+        return ""
+    now = time.time() if now is None else now
+    age = now - fetched_ts
+    if age >= interval * 1.5:
+        mins = max(1, round(age / 60.0))
+        return "cached {} min ago".format(mins)
+    return "updated {:%H:%M:%S}".format(datetime.fromtimestamp(fetched_ts))
+
+
 def gradient_colour(frac, brightness=1.0):
     """Colour at `frac` (0..1) along the neon green -> yellow -> orange ->
     red sweep: a full-saturation HSV hue walk from 120 degrees down to 0."""
@@ -371,15 +402,15 @@ class Strip:
         for a0, a1, label, bucket in self.hits:
             if a0 <= pos < a1:
                 pct = bucket.get("utilization") or 0.0
-                when = datetime.fromisoformat(bucket["resets_at"]).astimezone()
-                left = when - datetime.now(timezone.utc).astimezone()
-                line = "{}  {:.1f}%  -  resets {:%a %H:%M} (in {})".format(
-                    label, pct, when, fmt_left(left.total_seconds()))
-                if status:
-                    line += "\n" + status
-                elif fetched_ts:
-                    line += "\nupdated {:%H:%M:%S}".format(
-                        datetime.fromtimestamp(fetched_ts))
+                line = "{}  {:.1f}%".format(label, pct)
+                when = parse_reset(bucket.get("resets_at"))
+                if when is not None:
+                    left = when - datetime.now(timezone.utc).astimezone()
+                    line += "  -  resets {:%a %H:%M} (in {})".format(
+                        when, fmt_left(left.total_seconds()))
+                note = freshness_line(fetched_ts, status, self.app.interval)
+                if note:
+                    line += "\n" + note
                 return line, gradient_colour(pct / 100.0)
         if not self.hits:
             return (status or "waiting for first response...",
@@ -392,8 +423,8 @@ class Strip:
             self.tip.overrideredirect(True)
             self.tip.attributes("-topmost", True)
             self.tip_label = tk.Label(
-                self.tip, bg="#0a0a0a", font=("Consolas", 10),
-                justify="left", padx=8, pady=4, bd=1, relief="solid")
+                self.tip, bg="#0a0a0a", font=("Consolas", 13, "bold"),
+                justify="left", padx=10, pady=6, bd=1, relief="solid")
             self.tip_label.pack()
         self.tip_label.config(text=text, fg=fg)
         self.tip.update_idletasks()
