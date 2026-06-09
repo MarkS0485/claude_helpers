@@ -106,6 +106,53 @@ python claude_projects.py render                 # regenerate REGISTRY.md from p
 - **render** is deterministic and reproduces `REGISTRY.md` exactly (members
   sorted by name; explicit `children[]` order preserved).
 
+## claude_api.py — Anthropic API access + session compaction
+
+Reuses the token Claude Code already keeps on disk to talk to the Anthropic
+Messages API, and lets Claude **compact its own session transcripts** into a
+structured resume handoff — the programmatic cousin of the in-session
+`/compact`.
+
+```sh
+python claude_api.py whoami                        # auth source, scopes, expiry
+python claude_api.py sessions                       # this project's sessions (newest first; live one marked)
+python claude_api.py rename "New title" [SESSION]   # rename a session
+python claude_api.py count [SESSION]                 # token count of a transcript
+python claude_api.py compact [SESSION] --out HANDOFF.md   # Claude-compact a session
+python claude_api.py ask "prompt" --model claude-opus-4-8  # one-shot prompt
+python claude_api.py models                          # list available models
+```
+
+`SESSION` is a session id, a path to a `.jsonl`, or omitted — in which case it
+defaults to the **live** session (the most recently modified transcript for the
+current working directory's project). Sessions are read straight from
+`~/.claude/projects/<slug>/<id>.jsonl`, where `<slug>` is the working directory
+with each non-alphanumeric character replaced by `-` (so `D:\claude` →
+`D--claude`).
+
+- **compact** flattens a transcript (user/assistant turns, tool calls and
+  results, oversized I/O truncated; thinking omitted unless `--thinking`) and
+  asks Claude for a fixed-section handoff — *Task & context / Work done /
+  Current state / Files & artifacts / Key decisions / Next step*. Transcripts
+  too large for one request are summarised rolling, chunk by chunk, so size is
+  not a limit. `--out FILE` writes it (with `--append` to add onto an existing
+  handoff); `--focus "..."` steers the emphasis. Paste the result into a fresh
+  session to carry on with no loss of context. It produces a *summary*; it does
+  not reach into a running CLI to swap its live context — that stays the
+  in-session `/compact`'s job.
+- **rename** sets the title Claude Code shows for a session by updating the
+  `ai-title` line inside the transcript in place (every other line preserved
+  byte-for-byte; a new line is appended if the session was never titled). Best
+  run on a session that isn't live, to avoid racing the running CLI's writes.
+
+### Auth
+
+Prefers `ANTHROPIC_API_KEY` (`x-api-key`) if set; otherwise the Claude Code
+OAuth token from `~/.claude/.credentials.json`. The OAuth path needs the
+`oauth-2025-04-20` beta header and a system prompt that leads with the Claude
+Code identity line — both are applied automatically, and `user:inference` scope
+is required (check with `whoami`). Stdlib only — nothing to `pip install`.
+
 ## claude_usage.py — live usage monitor
 
 A terminal dashboard showing your Claude subscription usage — session (5-hour)
