@@ -106,6 +106,40 @@ python claude_projects.py render                 # regenerate REGISTRY.md from p
 - **render** is deterministic and reproduces `REGISTRY.md` exactly (members
   sorted by name; explicit `children[]` order preserved).
 
+## claude_bugs.py — durable bug-list collector
+
+A backlog of bug reports gathered from chat (primarily Slack) so they can be
+triaged, grouped by similarity, fixed and pushed in batches. Claude reads the
+channels (via the Slack MCP tools) and does the semantic grouping; this helper
+is the **store** underneath — it survives across sessions, bulk-imports a whole
+scrape in one shot, labels bugs into similarity groups, and marks them resolved
+once the fix ships. Stdlib only.
+
+```sh
+python claude_bugs.py add "logout 500s on mobile" --channel "#bugs" --author alice
+python claude_bugs.py import --file scrape.json   # JSON array (or stdin); ids auto-assigned
+python claude_bugs.py list --status open --json   # feed triage / clustering
+python claude_bugs.py group --label logout 2 3 7  # record a similarity cluster
+python claude_bugs.py groups                       # per-group open/resolved counts
+python claude_bugs.py resolve --group logout       # once the fix is pushed
+python claude_bugs.py remove --resolved            # purge what's shipped
+python claude_bugs.py stats                        # totals by status/channel/group
+```
+
+The intended phrase is **"update bugs from Slack"**: Claude reads every channel,
+builds a JSON array of `{text, channel, author, ts, permalink}` records, and
+pipes it through `import` in one call. `import` accepts loose field names
+(`message`/`body` for text, `user` for author, `url` for permalink, …) so a raw
+scrape passes straight in, and tolerates the UTF-8 BOM that Windows PowerShell's
+`Out-File` writes. **Duplicates are kept on purpose** — the same bug in three
+channels is signal, not noise — so de-duping is left to triage, never to ingest.
+
+Ids are sequential and **never reused** (a persisted `seq` counter), so a bug's
+`#id` stays a stable handle even after others are removed. The store defaults to
+`<estate>\_claude\bugs\bugs.json` (override with `--store` or `CLAUDE_BUGS_STORE`);
+every write keeps a one-deep `.bak`. `resolve`/`reopen`/`remove` take either a
+list of ids, a `--group NAME`, or `--all` (wiping all needs `--yes`).
+
 ## claude_api.py — Anthropic API access + session compaction
 
 Reuses the token Claude Code already keeps on disk to talk to the Anthropic
