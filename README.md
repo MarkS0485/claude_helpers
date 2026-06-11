@@ -119,26 +119,51 @@ once the fix ships. Stdlib only.
 python claude_bugs.py add "logout 500s on mobile" --channel "#bugs" --author alice
 python claude_bugs.py import --file scrape.json   # JSON array (or stdin); ids auto-assigned
 python claude_bugs.py list --status open --json   # feed triage / clustering
-python claude_bugs.py group --label logout 2 3 7  # record a similarity cluster
-python claude_bugs.py groups                       # per-group open/resolved counts
-python claude_bugs.py resolve --group logout       # once the fix is pushed
+python claude_bugs.py group --label logout 2 3 7  # record a manual cluster
+python claude_bugs.py regroup                      # (re)cluster by error signature
+python claude_bugs.py groups                       # per-group 🐛 / ✅ / 🚫 counts
+python claude_bugs.py resolve --group logout       # ✅ fix shipped
+python claude_bugs.py close 9                       # 🚫 dismissed / won't-fix
 python claude_bugs.py remove --resolved            # purge what's shipped
-python claude_bugs.py stats                        # totals by status/channel/group
+python claude_bugs.py stats                        # open/resolved/closed + backlog
 ```
 
 The intended phrase is **"update bugs from Slack"**: Claude reads every channel,
 builds a JSON array of `{text, channel, author, ts, permalink}` records, and
 pipes it through `import` in one call. `import` accepts loose field names
-(`message`/`body` for text, `user` for author, `url` for permalink, …) so a raw
-scrape passes straight in, and tolerates the UTF-8 BOM that Windows PowerShell's
-`Out-File` writes. **Duplicates are kept on purpose** — the same bug in three
-channels is signal, not noise — so de-duping is left to triage, never to ingest.
+(`message`/`body` for text, `user` for author, `url` for permalink, `trace`/
+`stack` for detail, …) so a raw scrape passes straight in, and tolerates the
+UTF-8 BOM that Windows PowerShell's `Out-File` writes. **Duplicates are kept on
+purpose** — the same bug in three channels is signal, not noise — so de-duping
+is left to triage, never to ingest.
+
+**Machine-posted errors** (the `#forge-errors` / `#stack-errors` /
+`#server-messages` channels) are stored split: the summary line becomes `text`,
+the full stack trace / server message is kept in `detail` (shown by `list
+--full`), and an error `signature` is computed with the volatile bits — ids,
+GUIDs, file paths, line numbers, timestamps, hex addresses — masked out. `import`
+**auto-clusters by that signature** by default (`--no-autogroup` to skip), so the
+same `NullReferenceException` recurring on different lines, or a build failing
+for different coin GUIDs, lands in one group. `regroup [--overwrite]` does the
+same to bugs already in the store.
+
+**Status & emoji.** Every bug carries a status shown with an emoji: 🐛 `open`
+(picked up, still to fix), ✅ `resolved` (fix shipped), 🚫 `closed`
+(dismissed / won't-fix). `resolve` / `close` / `reopen` each take a list of ids,
+a `--group NAME`, or `--all`. The same marks are mirrored onto the **source Slack
+messages** as reactions (`:bug:` on pickup, `:white_check_mark:` when solved) by
+Claude during the trawl — see `SLACK_REACTION` in the script.
+
+**`stats`** reports totals — 🐛 open, ✅ resolved, 🚫 closed — plus an estimated
+**backlog**: clearing bugs is reckoned at 900 per 30 days (≈30/day), so the
+estimate is `open ÷ 900 × 30` days (900 open → ~30 days, 1800 → ~60). Tune the
+rate via `BACKLOG_BUGS_PER_WINDOW` / `BACKLOG_WINDOW_DAYS`.
 
 Ids are sequential and **never reused** (a persisted `seq` counter), so a bug's
 `#id` stays a stable handle even after others are removed. The store defaults to
 `<estate>\_claude\bugs\bugs.json` (override with `--store` or `CLAUDE_BUGS_STORE`);
-every write keeps a one-deep `.bak`. `resolve`/`reopen`/`remove` take either a
-list of ids, a `--group NAME`, or `--all` (wiping all needs `--yes`).
+every write keeps a one-deep `.bak`. `remove` takes ids, `--resolved`, `--closed`,
+or `--all` (wiping all needs `--yes`).
 
 ## claude_api.py — Anthropic API access + session compaction
 
